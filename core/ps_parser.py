@@ -13,8 +13,13 @@ Deps: PyMuPDF, pytesseract, Pillow, tesseract-ocr (system package).
 import re
 import io
 import fitz               # PyMuPDF
-import pytesseract
-from PIL import Image
+
+try:
+    import pytesseract
+    from PIL import Image
+    _OCR_AVAILABLE = True
+except ImportError:
+    _OCR_AVAILABLE = False
 
 # Adjust these to match your actual package layout.
 from .config import fast, safe_parse_json    # ChatGroq client + JSON repair helper
@@ -39,6 +44,9 @@ def page_text_with_ocr_fallback(page, min_chars=30, dpi=200):
     text = page.get_text()
     if len(text.strip()) >= min_chars:
         return text, False
+
+    if not _OCR_AVAILABLE:
+        return text, False  # no tesseract — return whatever fitz got
 
     pix = page.get_pixmap(dpi=dpi)
     img = Image.open(io.BytesIO(pix.tobytes("png")))
