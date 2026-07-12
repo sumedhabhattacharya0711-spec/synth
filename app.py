@@ -174,6 +174,13 @@ def run_pipeline(ps_text: str, ps_file, progress=gr.Progress(track_tqdm=True)):
         yield "❌ Provide a problem statement or upload a PDF."
         return
 
+    output = ""
+
+    def emit(text: str):
+        nonlocal output
+        output += text + "\n"
+        return output
+
     # Load pipeline modules on first request (lazy init for fast startup)
     yield "⏳ Loading pipeline modules (first run only — ~60s)…"
     try:
@@ -182,13 +189,6 @@ def run_pipeline(ps_text: str, ps_file, progress=gr.Progress(track_tqdm=True)):
         yield f"❌ Pipeline load failed: {e}"
         return
     yield emit("✅ Pipeline loaded\n")
-
-    output = ""
-
-    def emit(text: str):
-        nonlocal output
-        output += text + "\n"
-        return output
 
     # ── Stage 0: parse PS ───────────────────────────────────────────────────
     progress(0.0, desc="parsing problem statement…")
