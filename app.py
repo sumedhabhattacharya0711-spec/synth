@@ -18,16 +18,46 @@ from pathlib import Path
 
 import gradio as gr
 
-# ── pipeline imports ────────────────────────────────────────────────────────
-# core/ sits alongside app.py in the Space repo root
-from core.config import big, fast, safe_parse_json
-from core.store import manifest, collection
-from core.retrieval import rebuild_bm25
-from core.orchestrator import extract_domain_anchor, orchestrate_final
-from core.librarian import librarian_v2
-from core.agents import mcp_fallback_node
-from core.synthesis import ingest_papers_quick, synthesize
-from core.ps_parser import parse_ps_pdf
+# ── pipeline imports (lazy) ──────────────────────────────────────────────────
+# Deferred until first request so Gradio starts immediately and passes
+# Render's health check before the heavy pipeline modules finish loading.
+# Each module loads once and is cached in these globals.
+_pipeline_loaded = False
+_big = _fast = _safe_parse_json = None
+_manifest = _collection = _rebuild_bm25 = None
+_extract_domain_anchor = _orchestrate_final = None
+_librarian_v2 = _mcp_fallback_node = None
+_ingest_papers_quick = _synthesize = None
+_parse_ps_pdf = None
+
+def _load_pipeline():
+    global _pipeline_loaded
+    global _big, _fast, _safe_parse_json
+    global _manifest, _collection, _rebuild_bm25
+    global _extract_domain_anchor, _orchestrate_final
+    global _librarian_v2, _mcp_fallback_node
+    global _ingest_papers_quick, _synthesize
+    global _parse_ps_pdf
+
+    if _pipeline_loaded:
+        return
+
+    from core.config import _big, fast, safe_parse_json
+    from core.store import manifest, collection
+    from core.retrieval import rebuild_bm25
+    from core.orchestrator import extract_domain_anchor, orchestrate_final
+    from core.librarian import librarian_v2
+    from core.agents import mcp_fallback_node
+    from core.synthesis import ingest_papers_quick, synthesize
+    from core.ps_parser import parse_ps_pdf
+
+    _big = big; _fast = fast; _safe_parse_json = safe_parse_json
+    _manifest = manifest; _collection = collection; _rebuild_bm25 = rebuild_bm25
+    _extract_domain_anchor = extract_domain_anchor; _orchestrate_final = orchestrate_final
+    _librarian_v2 = librarian_v2; _mcp_fallback_node = mcp_fallback_node
+    _ingest_papers_quick = ingest_papers_quick; _synthesize = synthesize
+    _parse_ps_pdf = parse_ps_pdf
+    _pipeline_loaded = True
 
 
 # ── PS structuring for raw-text input ───────────────────────────────────────
@@ -54,8 +84,8 @@ Return ONLY JSON:
   "technical_requirements": "specific models, tools, constraints mentioned",
   "dataset_description": "any dataset details if mentioned"
 }}"""
-    out = fast.invoke(prompt)
-    parsed = safe_parse_json(out.content)
+    out = _fast.invoke(prompt)
+    parsed = _safe_parse_json(out.content)
     if not parsed:
         return {"clean_text": raw_text, "weights": {}, "deliverables": [], "tasks": []}
 
@@ -144,6 +174,10 @@ def run_pipeline(ps_text: str, ps_file, progress=gr.Progress(track_tqdm=True)):
         yield "❌ Provide a problem statement or upload a PDF."
         return
 
+    # Load pipeline modules on first request (lazy init for fast startup)
+    yield "⏳ Loading pipeline modules (first run only — ~60s)…"
+    _load_pipeline()
+
     output = ""
 
     def emit(text: str):
@@ -158,7 +192,7 @@ def run_pipeline(ps_text: str, ps_file, progress=gr.Progress(track_tqdm=True)):
     try:
         if ps_file is not None:
             # gr.File with type="filepath" gives a plain string path, not an object
-            ps_data = parse_ps_pdf(Path(ps_file))
+            ps_data = _parse_ps_pdf(Path(ps_file))
         else:
             ps_data = structure_raw_ps(ps_text.strip())
     except Exception as e:
@@ -176,10 +210,9 @@ def run_pipeline(ps_text: str, ps_file, progress=gr.Progress(track_tqdm=True)):
     yield emit("### 🧠 Stage 2 — Generating hypotheses (YAKE + spaCy + arXiv bootstrap)…")
 
     try:
-        domain_anchor = extract_domain_anchor(PS)
-        hypotheses = orchestrate_final(
-            PS, big,
-            top_n=5,
+        domain_anchor = _extract_domain_anchor(PS)
+        hypotheses = _orchestrate_final(
+            PS, _big,             top_n=5,
             weights=ps_weights,
             deliverables=ps_deliverables,
         )
@@ -197,7 +230,7 @@ def run_pipeline(ps_text: str, ps_file, progress=gr.Progress(track_tqdm=True)):
     yield emit("### 📚 Stage 3 — Searching literature (arXiv + Semantic Scholar)…")
 
     try:
-        papers = librarian_v2(
+        papers = _librarian_v2(
             hypotheses, ps=PS, depth=1,
             seeds_per_query=3, chase_top_n=5,
             max_total=60, domain_anchor=domain_anchor,
@@ -222,7 +255,7 @@ def run_pipeline(ps_text: str, ps_file, progress=gr.Progress(track_tqdm=True)):
         yield emit(f"### 🔄 Stage 4 — MCP fallback search ({len(empty_hyps)} hypotheses had no papers)…")
         for h in empty_hyps:
             try:
-                extra = mcp_fallback_node(h, PS)
+                extra = _mcp_fallback_node(h, PS)
                 papers.extend(extra)
                 if extra:
                     yield emit(f"  ✅ {len(extra)} papers found for `{h['hypothesis'][:60]}…`")
@@ -239,9 +272,9 @@ def run_pipeline(ps_text: str, ps_file, progress=gr.Progress(track_tqdm=True)):
     yield emit("### 💾 Stage 5 — Ingesting papers into vector store…")
 
     try:
-        added = ingest_papers_quick(papers, max_papers=10)
+        added = _ingest_papers_quick(papers, max_papers=10)
         if added > 0:
-            rebuild_bm25()
+            _rebuild_bm25()
         yield emit(f"✅ {added} new papers ingested\n")
     except Exception as e:
         yield emit(f"\n⚠️ Ingestion partially failed: {e} — continuing with existing corpus\n")
@@ -252,7 +285,7 @@ def run_pipeline(ps_text: str, ps_file, progress=gr.Progress(track_tqdm=True)):
     yield emit("*(each hypothesis runs a full retrieve → grade → verify loop — please wait)*\n")
 
     try:
-        report, sections = synthesize(PS, hypotheses, papers)
+        report, sections = _synthesize(PS, hypotheses, papers)
     except Exception as e:
         yield emit(f"\n❌ Synthesis failed: {e}")
         return
