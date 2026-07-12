@@ -12,28 +12,26 @@ from .store import collection, emb_model, Q_PREFIX
 def bm25_tok(s):
     return re.findall(r"[a-z0-9]+", s.lower())
 
-data = collection.get(include=["documents"])
-chunk_ids, docs = data["ids"], data["documents"]
-doc_lookup = dict(zip(chunk_ids, docs))
-
-if docs:
-    bm25 = BM25Okapi([bm25_tok(d) for d in docs])
-    print(f"BM25 built: {len(docs)} chunks")
-else:
-    bm25 = None
-    print("BM25 skipped: corpus empty (will rebuild after ingestion)")
+chunk_ids, docs, doc_lookup, bm25 = [], [], {}, None
 
 def rebuild_bm25():
     global chunk_ids, docs, doc_lookup, bm25
     data = collection.get(include=["documents"])
     chunk_ids, docs = data["ids"], data["documents"]
     doc_lookup = dict(zip(chunk_ids, docs))
-    bm25 = BM25Okapi([bm25_tok(d) for d in docs])
-    print(f"BM25 rebuilt: {len(docs)} chunks")
+    bm25 = BM25Okapi([bm25_tok(d) for d in docs]) if docs else None
+    print(f"BM25 built: {len(docs)} chunks")
+
+def _ensure_bm25():
+    """Lazy-init: load corpus into RAM only on first retrieval call."""
+    global bm25
+    if bm25 is None:
+        rebuild_bm25()
 
 # ---------- Hybrid Retrieval (Dense + BM25 + RRF) ----------
 
 def hybrid_retrieve(q, top_k=5, k_each=20):
+    _ensure_bm25()
     qv = emb_model.encode(Q_PREFIX + q, normalize_embeddings=True)
     dense = collection.query(
         query_embeddings=[qv.tolist()], n_results=k_each)["ids"][0]
