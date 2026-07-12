@@ -10,7 +10,6 @@ fastmcp
 mcp
 
 # --- ML / embeddings ---
-sentence-transformers
 transformers
 
 # --- vector store / retrieval ---
@@ -31,7 +30,6 @@ spacy
 
 # --- PDF parsing ---
 PyMuPDF
-pytesseract
 Pillow
 
 # --- utilities ---
