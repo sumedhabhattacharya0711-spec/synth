@@ -23,7 +23,7 @@ mcp = FastMCP("research-tools")
 S2_BASE = "https://api.semanticscholar.org/graph/v1"
 S2_API_KEY = os.environ.get("S2_API_KEY")
 S2_FIELDS = "title,abstract,year,externalIds,url,referenceCount,citationCount"
-S2_CACHE = Path(os.environ.get("DATA_DIR", "/app/store")) / "cache" / "s2"
+S2_CACHE = Path(os.environ.get("DATA_DIR", "store")) / "cache" / "s2"
 S2_CACHE.mkdir(parents=True, exist_ok=True)
 
 _last_call = 0
