@@ -24,7 +24,7 @@ networkx
 
 # --- NLP ---
 yake
-spacy
+spacy==3.7.4
 # en_core_web_sm: add to Space's README.md setup command or
 # run once via: python -m spacy download en_core_web_sm
 
