@@ -55,7 +55,7 @@ class HFReranker:
     identical in meaning to CrossEncoder.predict() output.
     """
     _MODEL = "BAAI/bge-reranker-base"
-    _URL   = f"https://api-inference.huggingface.co/models/{_MODEL}"
+    _URL   = f"https://router.huggingface.co/hf-inference/models/{_MODEL}"
 
     def __init__(self):
         self._headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
@@ -63,29 +63,40 @@ class HFReranker:
     def predict(self, pairs, **kwargs):
         """
         pairs: list of [query, text] or (query, text) tuples
-        Returns: list[float] — one score per pair, same as CrossEncoder.predict()
+        Returns: list[float] — one score per pair.
+        Falls back to 0.0 scores if API is unavailable so pipeline never crashes.
         """
-        import time as _time, numpy as _np
+        import time as _time
         scores = []
         for query, text in pairs:
-            for attempt in range(2):
-                resp = requests.post(
-                    self._URL,
-                    headers=self._headers,
-                    json={"inputs": {"source_sentence": query,
-                                     "sentences": [text]},
-                          "options": {"wait_for_model": True}},
-                    timeout=30,
-                )
-                if resp.status_code == 503 and attempt == 0:
-                    _time.sleep(20)
-                    continue
-                resp.raise_for_status()
-                result = resp.json()
-                # API returns list[float] with one score per sentence
-                score = result[0] if isinstance(result, list) else result
-                scores.append(float(score))
-                break
+            try:
+                for attempt in range(2):
+                    resp = requests.post(
+                        self._URL,
+                        headers=self._headers,
+                        json={"inputs": [[query, text]]},
+                        timeout=30,
+                    )
+                    if resp.status_code == 503 and attempt == 0:
+                        _time.sleep(20)
+                        continue
+                    resp.raise_for_status()
+                    result = resp.json()
+                    if isinstance(result, list) and len(result) > 0:
+                        inner = result[0]
+                        if isinstance(inner, list):
+                            score = max(item["score"] for item in inner)
+                        elif isinstance(inner, dict):
+                            score = inner.get("score", 0.0)
+                        else:
+                            score = float(inner)
+                    else:
+                        score = float(result) if result else 0.0
+                    scores.append(score)
+                    break
+            except Exception as e:
+                print(f"  reranker API error (using 0.0): {e}")
+                scores.append(0.0)
         return scores
 
 
