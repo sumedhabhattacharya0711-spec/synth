@@ -42,7 +42,7 @@ def _load_pipeline():
     if _pipeline_loaded:
         return
 
-    from core.config import _big, fast, safe_parse_json
+    from core.config import big, fast, safe_parse_json
     from core.store import manifest, collection
     from core.retrieval import rebuild_bm25
     from core.orchestrator import extract_domain_anchor, orchestrate_final
