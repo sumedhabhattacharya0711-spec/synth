@@ -176,7 +176,12 @@ def run_pipeline(ps_text: str, ps_file, progress=gr.Progress(track_tqdm=True)):
 
     # Load pipeline modules on first request (lazy init for fast startup)
     yield "⏳ Loading pipeline modules (first run only — ~60s)…"
-    _load_pipeline()
+    try:
+        _load_pipeline()
+    except Exception as e:
+        yield f"❌ Pipeline load failed: {e}"
+        return
+    yield emit("✅ Pipeline loaded\n")
 
     output = ""
 
