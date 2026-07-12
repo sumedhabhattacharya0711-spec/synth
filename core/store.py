@@ -15,7 +15,7 @@ import os
 from .config import re, json, hashlib, datetime, Path, chromadb, AutoTokenizer, requests, HF_TOKEN
 
 # ---------- Store ----------
-STORE = Path(os.environ.get("DATA_DIR", "store"))
+STORE = Path(os.environ.get("DATA_DIR", "/app/store"))
 STORE.mkdir(exist_ok=True)
 (STORE / "pdfs").mkdir(exist_ok=True)
 (STORE / "markdown").mkdir(exist_ok=True)
@@ -182,17 +182,11 @@ class HFEmbedder:
     BAAI/bge-base-en-v1.5. Produces L2-normalized float32 vectors
     identical to SentenceTransformer(..., normalize_embeddings=True).
     Batches automatically; retries once on 503 (model loading cold start).
-
-    NOTE: HF fully decommissioned api-inference.huggingface.co in favor of
-    router.huggingface.co (the old domain now fails DNS resolution, not
-    just a clean HTTP error). This class targets the new router endpoint.
-    Requires a valid HF_TOKEN — the new router does not reliably serve
-    anonymous requests the way the old endpoint sometimes did.
     """
     import numpy as _np
 
     _MODEL = "BAAI/bge-base-en-v1.5"
-    _URL   = f"https://router.huggingface.co/hf-inference/models/{_MODEL}/pipeline/feature-extraction"
+    _URL   = f"https://router.huggingface.co/hf-inference/models/{_MODEL}"
     _BATCH = 64   # HF Inference API limit per request
 
     def __init__(self):
@@ -200,17 +194,21 @@ class HFEmbedder:
 
     def _call_api(self, texts, attempt=0):
         import time as _time
-        resp = requests.post(
-            self._URL,
-            headers=self._headers,
-            json={"inputs": texts, "options": {"wait_for_model": True}},
-            timeout=60,
-        )
-        if resp.status_code == 503 and attempt == 0:
-            _time.sleep(20)
-            return self._call_api(texts, attempt=1)
-        resp.raise_for_status()
-        return resp.json()
+        try:
+            resp = requests.post(
+                self._URL,
+                headers=self._headers,
+                json={"inputs": texts, "options": {"wait_for_model": True}},
+                timeout=60,
+            )
+            if resp.status_code == 503 and attempt == 0:
+                _time.sleep(20)
+                return self._call_api(texts, attempt=1)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            print(f"  embedder API error: {e}")
+            raise
 
     def encode(self, sentences, normalize_embeddings=True,
                show_progress_bar=False, **kwargs):
