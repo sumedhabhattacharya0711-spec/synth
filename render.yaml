@@ -1,0 +1,10 @@
+﻿services:
+  - type: web
+    name: synth
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: PORT
+        value: 7860
+    healthCheckPath: /
