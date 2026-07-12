@@ -182,11 +182,17 @@ class HFEmbedder:
     BAAI/bge-base-en-v1.5. Produces L2-normalized float32 vectors
     identical to SentenceTransformer(..., normalize_embeddings=True).
     Batches automatically; retries once on 503 (model loading cold start).
+
+    NOTE: HF fully decommissioned api-inference.huggingface.co in favor of
+    router.huggingface.co (the old domain now fails DNS resolution, not
+    just a clean HTTP error). This class targets the new router endpoint.
+    Requires a valid HF_TOKEN — the new router does not reliably serve
+    anonymous requests the way the old endpoint sometimes did.
     """
     import numpy as _np
 
     _MODEL = "BAAI/bge-base-en-v1.5"
-    _URL   = f"https://api-inference.huggingface.co/models/{_MODEL}"
+    _URL   = f"https://router.huggingface.co/hf-inference/models/{_MODEL}/pipeline/feature-extraction"
     _BATCH = 64   # HF Inference API limit per request
 
     def __init__(self):
