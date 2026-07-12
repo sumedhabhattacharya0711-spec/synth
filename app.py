@@ -272,22 +272,7 @@ def run_pipeline(ps_text: str, ps_file, progress=gr.Progress(track_tqdm=True)):
 
 
 # ── Gradio UI ────────────────────────────────────────────────────────────────
-with gr.Blocks(
-    title="Research Synthesis Engine",
-    theme=gr.themes.Base(
-        primary_hue="orange",
-        neutral_hue="slate",
-        font=[gr.themes.GoogleFont("IBM Plex Mono"), "monospace"],
-    ),
-    css="""
-    .gradio-container { max-width: 960px !important; margin: 0 auto; }
-    #title { text-align: center; margin-bottom: 8px; }
-    #subtitle { text-align: center; color: #888; margin-bottom: 24px; font-size: 14px; }
-    #run-btn { background: #E8A33D !important; color: #1a1a1a !important; font-weight: 700; }
-    #run-btn:hover { opacity: 0.9; }
-    .output-panel { font-family: 'IBM Plex Mono', monospace; font-size: 13px; }
-    """,
-) as demo:
+with gr.Blocks(title="Research Synthesis Engine") as demo:
 
     gr.Markdown("# ◈ synth — research synthesis engine", elem_id="title")
     gr.Markdown(
@@ -343,4 +328,20 @@ with gr.Blocks(
     )
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        theme=gr.themes.Base(
+            primary_hue="orange",
+            neutral_hue="slate",
+            font=[gr.themes.GoogleFont("IBM Plex Mono"), "monospace"],
+        ),
+        css="""
+        .gradio-container { max-width: 960px !important; margin: 0 auto; }
+        #title { text-align: center; margin-bottom: 8px; }
+        #subtitle { text-align: center; color: #888; margin-bottom: 24px; font-size: 14px; }
+        #run-btn { background: #E8A33D !important; color: #1a1a1a !important; font-weight: 700; }
+        #run-btn:hover { opacity: 0.9; }
+        .output-panel { font-family: 'IBM Plex Mono', monospace; font-size: 13px; }
+        """,
+    )
