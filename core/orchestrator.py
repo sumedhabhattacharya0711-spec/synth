@@ -8,13 +8,6 @@ Corresponds to notebook Cell 4.
 from .config import re, time, defaultdict, Counter, arxiv, safe_parse_json
 
 import yake
-import spacy
-
-# en_core_web_sm is baked into the Docker image at build time
-# (RUN python -m spacy download en_core_web_sm) — not downloaded here,
-# so container startup doesn't depend on network access or eat time on
-# every cold start.
-nlp = spacy.load("en_core_web_sm")
 
 # ---------- Utilities ----------
 
@@ -106,26 +99,7 @@ def extract_keyphrases(ps, top_n=20):
         if len(clean) >= 5:
             phrases.append((clean.lower(), 0.8))
     
-    # ===== PRIORITY 2: spaCy noun chunks (grammatical) =====
-    
-    doc = nlp(ps)
-    for chunk in doc.noun_chunks:
-        text = chunk.text.strip()
-        stripped = re.sub(r"^(the|a|an|this|these|those|such|any|each|"
-                        r"every|all|many|some|our|their|its)\s+",
-                        "", text, flags=re.I)
-        if len(stripped) >= 5 and len(stripped.split()) <= 4:
-            phrases.append((stripped.lower(), 0.75))
-    
-    for token in doc:
-        if token.dep_ == "conj" and token.pos_ in ("NOUN", "PROPN"):
-            subtree = " ".join([t.text for t in token.subtree
-                               if t.dep_ not in ("punct", "cc")])
-            subtree = clean_term(subtree.strip())
-            if 4 <= len(subtree) <= 40 and len(subtree.split()) <= 3:
-                phrases.append((subtree.lower(), 0.75))
-    
-    # ===== PRIORITY 3: YAKE (statistical — fills gaps) =====
+    # ===== PRIORITY 2: YAKE (statistical — fills gaps) =====
     
     kw_extractor = yake.KeywordExtractor(
         lan="en", n=3, top=30, dedupLim=0.5)

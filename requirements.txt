@@ -24,9 +24,6 @@ networkx
 
 # --- NLP ---
 yake
-spacy==3.7.4
-# en_core_web_sm: add to Space's README.md setup command or
-# run once via: python -m spacy download en_core_web_sm
 
 # --- PDF parsing ---
 PyMuPDF
@@ -34,4 +31,3 @@ Pillow
 
 # --- utilities ---
 json-repair
-https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
