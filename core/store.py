@@ -15,7 +15,7 @@ import os
 from .config import re, json, hashlib, datetime, Path, chromadb, AutoTokenizer, requests, HF_TOKEN
 
 # ---------- Store ----------
-STORE = Path(os.environ.get("DATA_DIR", "/app/store"))
+STORE = Path(os.environ.get("DATA_DIR", "store"))
 STORE.mkdir(exist_ok=True)
 (STORE / "pdfs").mkdir(exist_ok=True)
 (STORE / "markdown").mkdir(exist_ok=True)
