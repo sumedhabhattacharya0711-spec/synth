@@ -1,38 +1,127 @@
 """
-mcp_fallback.py — spawns backend/mcp_server/research_server.py over stdio,
-loads its tools into a LangGraph ReAct agent, and runs it as a fallback
-paper search when librarian_v2's primary search comes up thin/empty for a
-given hypothesis.
+mcp_fallback.py — fallback paper search when librarian_v2's primary search
+comes up empty for a hypothesis.
 
-Owns all the MCP-specific plumbing (subprocess spawn, async tool loading,
-ReAct agent construction) so agents.py only ever deals with a plain
-synchronous function call — same shape as every other node in that file.
+ARCHITECTURE NOTE: Originally this spawned backend/mcp_server/research_server.py
+as a subprocess over MCP stdio transport. On 512MB hosts (Render free tier),
+the second Python process OOM-kills the service. This version keeps the exact
+same ReAct agent architecture and the same three tools — search_arxiv,
+search_semantic_scholar, get_paper_citations — but defines them as in-process
+LangChain tools instead of MCP tools. Same agent behavior, same search
+capability, zero subprocess.
 
-Called from wherever librarian_v2 is invoked (your pipeline orchestration
-layer), NOT wired into agent_synth's graph — agent_synth queries the
-already-ingested vector store; this searches arXiv/S2 live, which is a
-librarian-level concern, upstream of that graph.
+The MCP server (research_server.py) still exists for the demo/standalone use
+case; this module just doesn't spawn it.
 """
 
-import sys
-import asyncio
+import os
+import json
+import time
 from pathlib import Path
 
-from langchain_mcp_adapters.client import MultiServerMCPClient
+import arxiv
+import requests
+from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 
-from .config import big, safe_parse_json
+from .config import big, safe_parse_json, S2_API_KEY, S2_FIELDS
 
-# backend/core/mcp_fallback.py -> parent = core/, parent.parent = backend/
-_SERVER_PATH = Path(__file__).resolve().parent.parent / "mcp_server" / "research_server.py"
+# ── S2 helpers (mirrors research_server.py's auth/cache/rate-limit) ─────────
 
-_MCP_CONFIG = {
-    "research-tools": {
-        "command": sys.executable,  # same interpreter/venv as this process, not a bare "python" that may resolve elsewhere
-        "args": [str(_SERVER_PATH)],
-        "transport": "stdio",
-    }
-}
+S2_BASE = "https://api.semanticscholar.org/graph/v1"
+S2_CACHE = Path(os.environ.get("DATA_DIR", "store")) / "cache" / "s2"
+S2_CACHE.mkdir(parents=True, exist_ok=True)
+
+_last_call = [0.0]
+
+def _rate_limit(delay=0.2):
+    elapsed = time.time() - _last_call[0]
+    if elapsed < delay:
+        time.sleep(delay - elapsed)
+    _last_call[0] = time.time()
+
+def _s2_get(endpoint, params=None):
+    cache_key = endpoint.replace("/", "_") + "_" + json.dumps(params or {}, sort_keys=True)
+    cache_key = "".join(c for c in cache_key if c.isalnum() or c in "_-")[:150]
+    cache_path = S2_CACHE / f"{cache_key}.json"
+    if cache_path.exists():
+        raw = cache_path.read_text()
+        if raw.strip() == "null":
+            return None
+        return json.loads(raw)
+    _rate_limit()
+    try:
+        headers = {"x-api-key": S2_API_KEY} if S2_API_KEY else {}
+        r = requests.get(f"{S2_BASE}{endpoint}", params=params,
+                         headers=headers, timeout=15)
+        if r.status_code == 429:
+            time.sleep(3)
+            r = requests.get(f"{S2_BASE}{endpoint}", params=params,
+                             headers=headers, timeout=15)
+        if r.status_code != 200:
+            cache_path.write_text("null")
+            return None
+        data = r.json()
+        cache_path.write_text(json.dumps(data))
+        return data
+    except Exception:
+        cache_path.write_text("null")
+        return None
+
+
+# ── the same three tools, in-process ─────────────────────────────────────────
+
+@tool
+def search_arxiv(query: str, max_results: int = 5) -> list:
+    """Search arXiv for research papers matching a query.
+    Returns titles, abstracts, years, and PDF URLs."""
+    try:
+        results = list(arxiv.Client().results(
+            arxiv.Search(query=query, max_results=max_results,
+                         sort_by=arxiv.SortCriterion.Relevance)))
+        return [{
+            "title": r.title,
+            "abstract": r.summary[:500],
+            "year": r.published.year,
+            "pdf_url": r.pdf_url,
+            "arxiv_id": r.entry_id.split("/")[-1],
+        } for r in results]
+    except Exception as e:
+        return [{"error": str(e)}]
+
+
+@tool
+def search_semantic_scholar(query: str, limit: int = 5) -> list:
+    """Search Semantic Scholar for papers with citation data."""
+    try:
+        data = _s2_get("/paper/search",
+                       {"query": query, "limit": limit, "fields": S2_FIELDS})
+        papers = data.get("data") or [] if data else []
+        return [{
+            "title": p.get("title"),
+            "abstract": (p.get("abstract") or "")[:500],
+            "year": p.get("year"),
+            "citations": p.get("citationCount", 0),
+        } for p in papers]
+    except Exception as e:
+        return [{"error": str(e)}]
+
+
+@tool
+def get_paper_citations(s2_paper_id: str, limit: int = 10) -> list:
+    """Get papers that cite a given paper (forward citation chase)."""
+    try:
+        data = _s2_get(f"/paper/{s2_paper_id}/citations",
+                       {"fields": S2_FIELDS, "limit": limit})
+        citations = data.get("data") or [] if data else []
+        return [{"title": c["citingPaper"].get("title"),
+                 "year": c["citingPaper"].get("year")}
+                for c in citations if c.get("citingPaper", {}).get("title")]
+    except Exception as e:
+        return [{"error": str(e)}]
+
+
+TOOLS = [search_arxiv, search_semantic_scholar, get_paper_citations]
 
 FALLBACK_PROMPT = """You are searching for research papers relevant to this hypothesis,
 which the primary literature search failed to find enough for.
@@ -52,43 +141,32 @@ Return ONLY JSON in this exact shape (no other text):
 If you find nothing relevant, return {{"papers": []}}."""
 
 
-async def _run_mcp_fallback_async(hypothesis_text: str, ps_context: str) -> list[dict]:
-    client = MultiServerMCPClient(_MCP_CONFIG)
-    tools = await client.get_tools()
-
-    agent = create_react_agent(big, tools)
-
-    prompt = FALLBACK_PROMPT.format(
-        ps_context=ps_context[:300],
-        hypothesis=hypothesis_text)
-
-    result = await agent.ainvoke({"messages": [{"role": "user", "content": prompt}]})
-    final_message = result["messages"][-1].content
-
-    parsed = safe_parse_json(final_message)
-    papers = parsed.get("papers", []) if parsed else []
-
-    for p in papers:
-        p["source"] = "mcp_fallback"
-        p["source_hypothesis"] = hypothesis_text[:80]
-
-    return papers
-
-
-def run_mcp_fallback(hypothesis_text: str, ps_context: str = "") -> list[dict]:
+def run_mcp_fallback(hypothesis_text: str, ps_context: str = "") -> list:
     """
-    Synchronous entry point. Spawns the MCP server, runs a ReAct search
-    agent against it, and returns a list of paper dicts shaped like
-    librarian.py's normalize_s2()/arxiv_search() output (title, abstract,
-    year, pdf_url, source, source_hypothesis) — safe to merge directly
-    into the `papers` list librarian_v2 returns.
+    Synchronous entry point — same signature and return shape as before.
+    ReAct agent with in-process tools, no subprocess, no extra RAM.
 
     Returns [] on any failure rather than raising, since this is itself
-    a fallback path — if it fails too, the pipeline should just proceed
-    with whatever librarian_v2 already found.
+    a fallback path.
     """
     try:
-        return asyncio.run(_run_mcp_fallback_async(hypothesis_text, ps_context))
+        agent = create_react_agent(big, TOOLS)
+
+        prompt = FALLBACK_PROMPT.format(
+            ps_context=ps_context[:300],
+            hypothesis=hypothesis_text)
+
+        result = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
+        final_message = result["messages"][-1].content
+
+        parsed = safe_parse_json(final_message)
+        papers = parsed.get("papers", []) if parsed else []
+
+        for p in papers:
+            p["source"] = "mcp_fallback"
+            p["source_hypothesis"] = hypothesis_text[:80]
+
+        return papers
     except Exception as e:
-        print(f"  MCP fallback error: {e}")
+        print(f"  fallback agent error: {e}")
         return []

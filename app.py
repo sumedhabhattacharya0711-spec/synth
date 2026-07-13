@@ -260,7 +260,7 @@ def run_pipeline(ps_text: str, ps_file, progress=gr.Progress(track_tqdm=True)):
         yield emit(f"### 🔄 Stage 4 — MCP fallback search ({len(empty_hyps)} hypotheses had no papers)…")
         for h in empty_hyps:
             try:
-                extra = [] # MCP disabled on 512MB
+                extra = _mcp_fallback_node(h, PS)
                 papers.extend(extra)
                 if extra:
                     yield emit(f"  ✅ {len(extra)} papers found for `{h['hypothesis'][:60]}…`")

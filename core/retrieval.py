@@ -54,7 +54,7 @@ class HFReranker:
     BAAI/bge-reranker-base. Returns a list[float] of relevance scores
     identical in meaning to CrossEncoder.predict() output.
     """
-    _MODEL = "BAAI/bge-reranker-base"
+    _MODEL = "BAAI/bge-reranker-v2-m3"  # -base isn't served by any provider; v2-m3 is, via text-classification
     _URL   = f"https://router.huggingface.co/hf-inference/models/{_MODEL}"
 
     def __init__(self):
@@ -64,6 +64,8 @@ class HFReranker:
         """
         pairs: list of [query, text] or (query, text) tuples
         Returns: list[float] — one score per pair.
+        Uses HF text-classification format for cross-encoders:
+        {"inputs": {"text": query, "text_pair": passage}}
         Falls back to 0.0 scores if API is unavailable so pipeline never crashes.
         """
         import time as _time
@@ -74,7 +76,7 @@ class HFReranker:
                     resp = requests.post(
                         self._URL,
                         headers=self._headers,
-                        json={"inputs": [[query, text]]},
+                        json={"inputs": {"text": query, "text_pair": text}},
                         timeout=30,
                     )
                     if resp.status_code == 503 and attempt == 0:
@@ -82,16 +84,18 @@ class HFReranker:
                         continue
                     resp.raise_for_status()
                     result = resp.json()
-                    if isinstance(result, list) and len(result) > 0:
+                    # text-classification returns [{"label": "LABEL_0", "score": float}]
+                    # possibly nested: [[{...}]]
+                    if isinstance(result, list) and result:
                         inner = result[0]
-                        if isinstance(inner, list):
-                            score = max(item["score"] for item in inner)
+                        if isinstance(inner, list) and inner:
+                            score = inner[0].get("score", 0.0)
                         elif isinstance(inner, dict):
                             score = inner.get("score", 0.0)
                         else:
                             score = float(inner)
                     else:
-                        score = float(result) if result else 0.0
+                        score = 0.0
                     scores.append(score)
                     break
             except Exception as e:
