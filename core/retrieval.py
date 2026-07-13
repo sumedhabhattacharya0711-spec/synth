@@ -15,10 +15,16 @@ def bm25_tok(s):
 chunk_ids, docs, doc_lookup, bm25 = [], [], {}, None
 
 def rebuild_bm25():
-    global chunk_ids, docs, doc_lookup, bm25
+    global bm25
     data = collection.get(include=["documents"])
-    chunk_ids, docs = data["ids"], data["documents"]
-    doc_lookup = dict(zip(chunk_ids, docs))
+    # Mutate in place — agents.py holds references to these exact objects
+    # from its `from .retrieval import doc_lookup` at import time. Rebinding
+    # (chunk_ids = ...) would create new objects that agents.py never sees,
+    # causing KeyErrors on newly ingested chunks during synthesis.
+    chunk_ids[:] = data["ids"]
+    docs[:] = data["documents"]
+    doc_lookup.clear()
+    doc_lookup.update(zip(chunk_ids, docs))
     bm25 = BM25Okapi([bm25_tok(d) for d in docs]) if docs else None
     print(f"BM25 built: {len(docs)} chunks")
 
