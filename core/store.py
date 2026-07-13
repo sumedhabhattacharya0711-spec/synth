@@ -15,7 +15,7 @@ import os
 from .config import re, json, hashlib, datetime, Path, chromadb, AutoTokenizer, requests, HF_TOKEN
 
 # ---------- Store ----------
-STORE = Path(os.environ.get("DATA_DIR", "store"))
+STORE = Path(os.environ.get("DATA_DIR", "/app/store"))
 STORE.mkdir(exist_ok=True)
 (STORE / "pdfs").mkdir(exist_ok=True)
 (STORE / "markdown").mkdir(exist_ok=True)
@@ -194,6 +194,7 @@ class HFEmbedder:
 
     def _call_api(self, texts, attempt=0):
         import time as _time
+        max_attempts = 3
         try:
             resp = requests.post(
                 self._URL,
@@ -201,13 +202,21 @@ class HFEmbedder:
                 json={"inputs": texts, "options": {"wait_for_model": True}},
                 timeout=60,
             )
-            if resp.status_code == 503 and attempt == 0:
-                _time.sleep(20)
-                return self._call_api(texts, attempt=1)
+            # 503 = model loading, 5xx = transient HF server issues — retry both
+            if resp.status_code in (500, 502, 503, 504) and attempt < max_attempts:
+                wait = 10 * (attempt + 1)
+                print(f"  embedder HTTP {resp.status_code}, retry {attempt+1}/{max_attempts} in {wait}s")
+                _time.sleep(wait)
+                return self._call_api(texts, attempt=attempt + 1)
             resp.raise_for_status()
             return resp.json()
-        except Exception as e:
-            print(f"  embedder API error: {e}")
+        except requests.exceptions.RequestException as e:
+            if attempt < max_attempts:
+                wait = 10 * (attempt + 1)
+                print(f"  embedder error ({e}), retry {attempt+1}/{max_attempts} in {wait}s")
+                _time.sleep(wait)
+                return self._call_api(texts, attempt=attempt + 1)
+            print(f"  embedder failed after {max_attempts} retries: {e}")
             raise
 
     def encode(self, sentences, normalize_embeddings=True,

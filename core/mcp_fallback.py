@@ -71,12 +71,14 @@ def _s2_get(endpoint, params=None):
 
 # ── the same three tools, in-process ─────────────────────────────────────────
 
+_ARXIV_CLIENT = arxiv.Client(delay_seconds=3.0, num_retries=3)
+
 @tool
 def search_arxiv(query: str, max_results: int = 5) -> list:
     """Search arXiv for research papers matching a query.
     Returns titles, abstracts, years, and PDF URLs."""
     try:
-        results = list(arxiv.Client().results(
+        results = list(_ARXIV_CLIENT.results(
             arxiv.Search(query=query, max_results=max_results,
                          sort_by=arxiv.SortCriterion.Relevance)))
         return [{

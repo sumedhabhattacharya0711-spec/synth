@@ -63,10 +63,12 @@ def s2_citations(paper_id, limit=20):
     return [r["citingPaper"] for r in (data.get("data") or [] if data else [])
             if r.get("citingPaper", {}).get("title")]
 
+_ARXIV_CLIENT = arxiv.Client(delay_seconds=3.0, num_retries=3)
+
 def arxiv_search(query, max_results=3):
     results = []
     try:
-        for r in arxiv.Client().results(
+        for r in _ARXIV_CLIENT.results(
             arxiv.Search(query=query, max_results=max_results,
                          sort_by=arxiv.SortCriterion.Relevance)):
             results.append({
@@ -77,7 +79,6 @@ def arxiv_search(query, max_results=3):
                 "arxiv_id": r.entry_id.split("/")[-1],
                 "source": "arxiv",
             })
-        time.sleep(1.0)
     except Exception as e:
         print(f"    arXiv error: {e}")
     return results
