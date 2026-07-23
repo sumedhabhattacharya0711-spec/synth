@@ -143,6 +143,64 @@ def extract_keyphrases(ps, top_n=20):
     
     return sorted(final.items(), key=lambda x: -x[1])[:top_n]
 
+# ---------- Shared term relevance scoring ----------
+#
+# parse_ps_universal's category lists (models/techniques/constraints/tasks/
+# modalities) are built via list(set(...)), whose iteration order isn't
+# stable across runs (str hash randomization) — so every downstream [:N]
+# slice and cartesian pairing was silently nondeterministic. score_terms
+# gives those lists a real, reproducible order; _terms_compatible uses that
+# same grounding info to stop pairing two terms that never actually relate
+# to each other in the source text.
+
+METHOD_KEYWORDS = {"attention", "augmented", "graph", "neural", "transformer",
+                   "embedding", "retrieval", "generation", "extraction",
+                   "classification", "detection", "clustering", "prediction",
+                   "inference", "attribution", "contrastive", "supervised",
+                   "reinforced", "adaptive", "hierarchical", "sparse", "dense",
+                   "hybrid", "recurrent", "convolutional", "masked", "gated",
+                   "dynamic", "iterative"}
+
+def score_terms(terms, ps_lower, keyphrases=None, arxiv_vocab=None):
+    """Rank extracted terms by relevance (keyphrase importance + arXiv
+    vocab frequency + literal PS presence). Ties break alphabetically so
+    the result is fully deterministic regardless of input order."""
+    kp_scores = {p.lower(): s for p, s in (keyphrases or [])}
+    vocab_counts = {t.lower(): c for t, c in (arxiv_vocab or [])}
+
+    scored = []
+    for term in terms:
+        t_lower = term.lower()
+        score = 0.0
+        if t_lower in kp_scores:
+            score += kp_scores[t_lower] * 2.0
+        else:
+            term_words = set(t_lower.split())
+            best_overlap = max(
+                (kp_scores[kp] for kp in kp_scores
+                 if term_words & set(kp.split())), default=0)
+            score += best_overlap * 0.5
+        if t_lower in vocab_counts:
+            score += min(vocab_counts[t_lower] / 5.0, 1.0)
+        if t_lower in ps_lower:
+            score += 0.5
+        scored.append((term, round(score, 3)))
+
+    return sorted(scored, key=lambda x: (-x[1], x[0]))
+
+def _terms_compatible(term_a, term_b, ps_lower, keyphrase_words, window=300):
+    """Gate a cartesian pairing: allow it if both terms co-occur near each
+    other in the PS text, or at least one side is grounded in the PS
+    (literal substring or shares a keyphrase word). Blocks pairing two
+    purely speculative bootstrapped terms that have no textual link."""
+    a, b = term_a.lower(), term_b.lower()
+    a_in_ps, b_in_ps = a in ps_lower, b in ps_lower
+    if a_in_ps and b_in_ps:
+        return abs(ps_lower.find(a) - ps_lower.find(b)) <= window
+    a_core = a_in_ps or bool(set(a.split()) & keyphrase_words)
+    b_core = b_in_ps or bool(set(b.split()) & keyphrase_words)
+    return a_core or b_core
+
 # ---------- Stage 2: arXiv vocabulary bootstrap ----------
 
 METHOD_PATTERN = re.compile(
@@ -209,7 +267,7 @@ def bootstrap_vocabulary(keyphrases, papers_per_query=5):
 
 # ---------- Stage 3: Structural parsing ----------
 
-def parse_ps_universal(ps, arxiv_vocab):
+def parse_ps_universal(ps, arxiv_vocab, keyphrases=None):
     acronyms = list(set(re.findall(
         r"\b[A-Z][A-Za-z]*[A-Z]+[a-z]*\b|\b[A-Z]{2,}\b", ps)))
     noise = {"THE","AND","FOR","WITH","YOUR","THIS","THAT","CAN",
@@ -277,25 +335,38 @@ def parse_ps_universal(ps, arxiv_vocab):
                 continue
         filtered_tasks.append(t)
     tasks = filtered_tasks
-    
+
+    def ranked(term_list):
+        return [t for t, s in score_terms(term_list, ps_lower, keyphrases, arxiv_vocab)]
+
     return {
-        "models": [m for m in models if len(m) >= 2],
-        "techniques": [t for t in techniques if len(t) >= 4],
-        "constraints": constraints,
-        "tasks": tasks,
-        "modalities": modalities,
+        "models": ranked([m for m in models if len(m) >= 2]),
+        "techniques": ranked([t for t in techniques if len(t) >= 4]),
+        "constraints": ranked(constraints),
+        "tasks": ranked(tasks),
+        "modalities": ranked(modalities),
         "arxiv_vocabulary": arxiv_terms,
     }
 
 # ---------- Stage 4: Combinatorial generation ----------
 
-def generate_combinatorial(parsed, keyphrases, domain_anchor):
+def generate_combinatorial(parsed, keyphrases, domain_anchor, ps=""):
     hypotheses = []
-    used_models = set()
-    
-    for tech in parsed["techniques"][:10]:
-        for constraint in parsed["constraints"][:5]:
+    ps_lower = ps.lower()
+    keyphrase_words = set()
+    for phrase, score in keyphrases:
+        keyphrase_words.update(phrase.lower().split())
+
+    def compatible(a, b):
+        # no PS text to check co-occurrence against — don't gate
+        return True if not ps_lower else _terms_compatible(
+            a, b, ps_lower, keyphrase_words)
+
+    for tech in parsed["techniques"][:8]:
+        for constraint in parsed["constraints"][:4]:
             if tech.lower() == constraint.lower():
+                continue
+            if not compatible(tech, constraint):
                 continue
             hypotheses.append({
                 "hypothesis": f"Applying {tech} under {constraint} "
@@ -308,29 +379,27 @@ def generate_combinatorial(parsed, keyphrases, domain_anchor):
                 "section_type": "feasibility",
                 "source_terms": [tech, constraint],
             })
-    
+
     for model in parsed["models"][:8]:
-        model_tasks = []
-        for task in parsed["tasks"][:5]:
-            if model.lower() not in used_models or len(model_tasks) == 0:
-                hypotheses.append({
-                    "hypothesis": f"Using {model} for {task}",
-                    "search_queries": [
-                        f"{model} {task}",
-                        f"{model} {task} {domain_anchor}",
-                        f"{model} based {task}",
-                    ],
-                    "section_type": "method",
-                    "source_terms": [model, task],
-                })
-                model_tasks.append(task)
-                used_models.add(model.lower())
-            if len(model_tasks) >= 2:
-                break
-    
+        candidate_tasks = [t for t in parsed["tasks"][:6]
+                           if compatible(model, t)][:2]
+        for task in candidate_tasks:
+            hypotheses.append({
+                "hypothesis": f"Using {model} for {task}",
+                "search_queries": [
+                    f"{model} {task}",
+                    f"{model} {task} {domain_anchor}",
+                    f"{model} based {task}",
+                ],
+                "section_type": "method",
+                "source_terms": [model, task],
+            })
+
     for mod in parsed["modalities"][:5]:
         for task in parsed["tasks"][:3]:
             if mod.lower() in task.lower():
+                continue
+            if not compatible(mod, task):
                 continue
             hypotheses.append({
                 "hypothesis": f"Enabling {task} through {mod} input "
@@ -342,10 +411,12 @@ def generate_combinatorial(parsed, keyphrases, domain_anchor):
                 "section_type": "method",
                 "source_terms": [mod, task],
             })
-    
+
     techs = parsed["techniques"][:8]
     for i in range(len(techs)):
         for j in range(i + 1, min(i + 3, len(techs))):
+            if not compatible(techs[i], techs[j]):
+                continue
             hypotheses.append({
                 "hypothesis": f"Comparing {techs[i]} and {techs[j]} "
                              f"for {domain_anchor}",
@@ -356,7 +427,7 @@ def generate_combinatorial(parsed, keyphrases, domain_anchor):
                 "section_type": "sota",
                 "source_terms": [techs[i], techs[j]],
             })
-    
+
     for phrase, score in keyphrases[:6]:
         hypotheses.append({
             "hypothesis": f"State of the art in {phrase} for {domain_anchor}",
@@ -369,20 +440,14 @@ def generate_combinatorial(parsed, keyphrases, domain_anchor):
             "source_terms": [phrase],
             "keyphrase_score": score,
         })
-    
-    method_keywords = {"attention", "augmented", "graph", "neural",
-                       "transformer", "embedding", "retrieval", "generation",
-                       "extraction", "classification", "detection", "clustering",
-                       "prediction", "inference", "attribution", "contrastive",
-                       "supervised", "reinforced", "adaptive", "hierarchical",
-                       "sparse", "dense", "hybrid", "recurrent", "convolutional",
-                       "masked", "gated", "dynamic", "iterative"}
-    
+
     arxiv_methods = [t for t in parsed.get("arxiv_vocabulary", [])
-                     if any(kw in t.lower() for kw in method_keywords)]
-    
+                     if any(kw in t.lower() for kw in METHOD_KEYWORDS)]
+
     for method in arxiv_methods[:6]:
         for task in parsed["tasks"][:4]:
+            if not compatible(method, task):
+                continue
             hypotheses.append({
                 "hypothesis": f"Applying {method} to {task} in {domain_anchor}",
                 "search_queries": [
@@ -393,7 +458,7 @@ def generate_combinatorial(parsed, keyphrases, domain_anchor):
                 "section_type": "method",
                 "source_terms": [method, task],
             })
-    
+
     return hypotheses
 
 # ---------- Dedup + coverage ----------
@@ -409,12 +474,26 @@ def deduplicate(hypotheses):
             seen.append(t)
     return unique
 
+def cap_raw_hypotheses(hypotheses, max_per_type=8):
+    """Bound how many candidates reach the network-bound validation stage.
+    Generation order is now deterministic and relevance-ranked (see
+    score_terms), so keeping the first N per section_type keeps the
+    highest-ranked candidates instead of an unbounded cartesian product."""
+    counts = defaultdict(int)
+    capped = []
+    for h in hypotheses:
+        t = h["section_type"]
+        if counts[t] < max_per_type:
+            capped.append(h)
+            counts[t] += 1
+    return capped
+
 def check_coverage(hypotheses, parsed):
     covered = set()
     for h in hypotheses:
         covered.update(t.lower() for t in h["source_terms"])
     all_terms = set()
-    for key in ["models", "techniques"]:
+    for key in ["models", "techniques", "constraints", "tasks", "modalities"]:
         all_terms.update(t.lower() for t in parsed.get(key, []))
     missing = [t for t in (all_terms - covered) if len(t) >= 3]
     if missing:
@@ -429,10 +508,39 @@ def check_coverage(hypotheses, parsed):
     return hypotheses
 
 # ---------- arXiv validation ----------
+#
+# Two-tier check, not one binary gate:
+#   - hard filter (terms_grounded): every individual source_term must have
+#     at least one arXiv hit on its own. This catches ungrounded/junk
+#     extraction artifacts — it does NOT require the *combination* to have
+#     prior art, so a novel pairing of two real things survives.
+#   - soft signal (arxiv_hits / title_match_rate / novel): the combined
+#     query is still searched and scored, but only recorded, not used to
+#     exclude. select_top's scoring already weights hits, so well-
+#     precedented hypotheses still rank higher without novel ones being
+#     deleted before they're ever scored.
 
 def validate_arxiv(hypotheses, min_hits=2, min_match=0.3):
+    term_cache = {}
+
+    def term_grounded(term):
+        key = term.lower()
+        if key in term_cache:
+            return term_cache[key]
+        try:
+            results = list(arxiv.Client().results(
+                arxiv.Search(query=term, max_results=2)))
+            grounded = len(results) >= 1
+            time.sleep(0.5)
+        except Exception:
+            grounded = True  # network hiccup — don't punish the term for it
+        term_cache[key] = grounded
+        return grounded
+
     validated = []
     for h in hypotheses:
+        terms_ok = all(term_grounded(t) for t in h.get("source_terms", []))
+
         query = h["search_queries"][0]
         query_words = set(re.findall(r"[a-z]+", query.lower()))
         query_words -= {"the","a","an","of","in","for","and","or","to",
@@ -451,16 +559,25 @@ def validate_arxiv(hypotheses, min_hits=2, min_match=0.3):
             else:
                 match_rate = 0
             time.sleep(1.0)
-        except:
+        except Exception as e:
+            print(f"    arxiv validation error: {e}")
             hits, match_rate = 0, 0
+
         h["arxiv_hits"] = hits
         h["title_match_rate"] = round(match_rate, 2)
-        if hits >= min_hits and match_rate >= min_match:
+        h["novel"] = hits < min_hits or match_rate < min_match
+        h["terms_grounded"] = terms_ok
+
+        if terms_ok:
             validated.append(h)
-            print(f"  ✓ [{hits} hits, {match_rate:.0%} match] {query[:50]}")
+            tag = "novel/low prior-art" if h["novel"] else "established"
+            print(f"  ✓ [{hits} hits, {match_rate:.0%} match, {tag}] {query[:50]}")
         else:
-            print(f"  ✗ [{hits} hits, {match_rate:.0%} match] {query[:50]}")
-    print(f"\n  {len(validated)} validated out of {len(hypotheses)}")
+            print(f"  ✗ [ungrounded source terms] {query[:50]}")
+
+    n_novel = sum(1 for h in validated if h["novel"])
+    print(f"\n  {len(validated)} grounded out of {len(hypotheses)} "
+          f"({n_novel} novel, {len(validated) - n_novel} established)")
     return validated
 
 # ---------- Selection ----------
@@ -491,30 +608,38 @@ def _llm_hypothesize(ps, parsed, candidates, llm, top_n, mode,
                      weights=None, deliverables=None):
     
     ps_lower = ps.lower()
-    
+
+    # parsed["techniques"]/["tasks"] mix PS-verbatim terms with terms
+    # bootstrapped from arXiv titles (Stage 2/3). Both are legitimate
+    # "extracted terms" per the RULES below — split them into labeled
+    # buckets instead of silently dropping the literature-derived half,
+    # and rely on score_terms' ranking (already applied in
+    # parse_ps_universal) rather than re-filtering by raw substring match.
     terms = []
     if parsed.get("models"):
         terms.append(f"Named models/tools: {', '.join(parsed['models'][:10])}")
     if parsed.get("techniques"):
-        real_techniques = [t for t in parsed["techniques"]
-                          if t.lower() in ps_lower or len(t.split()) == 1]
-        if real_techniques:
-            terms.append(f"Techniques: {', '.join(real_techniques[:10])}")
+        ps_techniques = [t for t in parsed["techniques"] if t.lower() in ps_lower]
+        lit_techniques = [t for t in parsed["techniques"] if t.lower() not in ps_lower]
+        if ps_techniques:
+            terms.append(f"Techniques mentioned in the PS: {', '.join(ps_techniques[:10])}")
+        if lit_techniques:
+            terms.append(f"Related techniques from the literature (may extend "
+                        f"beyond the PS): {', '.join(lit_techniques[:8])}")
     if parsed.get("constraints"):
         terms.append(f"Constraints: {', '.join(parsed['constraints'])}")
     if parsed.get("tasks"):
-        real_tasks = [t for t in parsed["tasks"] if t.lower() in ps_lower]
-        if real_tasks:
-            terms.append(f"Tasks: {', '.join(real_tasks[:10])}")
+        ps_tasks = [t for t in parsed["tasks"] if t.lower() in ps_lower]
+        lit_tasks = [t for t in parsed["tasks"] if t.lower() not in ps_lower]
+        if ps_tasks:
+            terms.append(f"Tasks mentioned in the PS: {', '.join(ps_tasks[:10])}")
+        if lit_tasks:
+            terms.append(f"Related tasks from the literature: {', '.join(lit_tasks[:6])}")
     if parsed.get("modalities"):
         terms.append(f"Input modalities: {', '.join(parsed['modalities'][:8])}")
-    
-    method_keywords = {"attention", "augmented", "graph", "neural",
-                       "retrieval", "generation", "extraction", "clustering",
-                       "prediction", "attribution", "adaptive", "hierarchical",
-                       "sparse", "hybrid", "masked", "dynamic"}
+
     arxiv_methods = [t for t in parsed.get("arxiv_vocabulary", [])
-                     if any(kw in t.lower() for kw in method_keywords)]
+                     if any(kw in t.lower() for kw in METHOD_KEYWORDS)]
     if arxiv_methods:
         terms.append(f"Research methods from arXiv: {', '.join(arxiv_methods[:8])}")
     
@@ -538,8 +663,12 @@ REQUIRED DELIVERABLES (hypotheses should help produce these):
 {chr(10).join(deliv_lines)}"""
     
     if candidates and mode == "polish":
+        def novelty_tag(h):
+            if "novel" not in h:
+                return ""
+            return " [novel/low prior-art]" if h["novel"] else " [established in literature]"
         cand_text = "\n".join(
-            f"  - {h['hypothesis'][:80]} (query: {h['search_queries'][0]})"
+            f"  - {h['hypothesis'][:80]}{novelty_tag(h)} (query: {h['search_queries'][0]})"
             for h in candidates[:8])
         candidate_section = f"""
 Auto-generated candidates (use as inspiration but rewrite completely):
@@ -615,7 +744,7 @@ def orchestrate_final(ps, llm, top_n=5, weights=None, deliverables=None):
     for term, count in arxiv_vocab[:5]:
         print(f"    [{count}x] {term}")
     
-    parsed = parse_ps_universal(ps, arxiv_vocab)
+    parsed = parse_ps_universal(ps, arxiv_vocab, keyphrases)
     for k, v in parsed.items():
         if v:
             print(f"  {k}: {v[:8]}{'...' if len(v) > 8 else ''}")
@@ -629,10 +758,12 @@ def orchestrate_final(ps, llm, top_n=5, weights=None, deliverables=None):
     print("STAGE 4-5: Combinatorial + arXiv Validation")
     print("=" * 60, "\n")
     
-    raw = generate_combinatorial(parsed, keyphrases, domain_anchor)
+    raw = generate_combinatorial(parsed, keyphrases, domain_anchor, ps)
     print(f"  {len(raw)} raw hypotheses")
     deduped = deduplicate(raw)
     print(f"  {len(deduped)} after dedup")
+    deduped = cap_raw_hypotheses(deduped)
+    print(f"  {len(deduped)} after capping (bounds load on arXiv validation)")
     deduped = check_coverage(deduped, parsed)
     print(f"  {len(deduped)} after coverage check")
     
