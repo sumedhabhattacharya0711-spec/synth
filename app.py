@@ -135,7 +135,11 @@ def format_sections_as_markdown(sections: list) -> str:
     lines.append("---\n")
 
     for i, s in enumerate(sections, 1):
-        status = "✅ verified" if s["verified"] else "⚠️ unverified"
+        unverified = s.get("unverified_claims", [])
+        if s["verified"]:
+            status = "✅ verified"
+        else:
+            status = f"⚠️ {len(unverified)} claim(s) unverified"
         section_type = s.get("section_type", "general")
         lines.append(f"## H{i} · `{section_type}` · {status}\n")
         lines.append(f"**{s['hypothesis']}**\n")
@@ -146,6 +150,12 @@ def format_sections_as_markdown(sections: list) -> str:
             for c in s["citations"][:5]:
                 title = c.get("title", "Unknown")[:70]
                 lines.append(f"- {title}")
+            lines.append("")
+
+        if unverified:
+            lines.append("**⚠️ Unverified claims — review these before trusting the section:**")
+            for uc in unverified:
+                lines.append(f"- \"{uc['text'][:150]}\" — *{uc['reason']}*")
             lines.append("")
 
         lines.append("---\n")

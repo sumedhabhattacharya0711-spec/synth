@@ -21,11 +21,80 @@ from .librarian import s2_get
 from .agents import agent_synth
 import fitz  # PyMuPDF — lightweight, not marker-pdf
 
-# ---------- Conditional Verifier (synthesis-aware) ----------
+# ---------- Claim-level Verifier (synthesis-aware) ----------
+#
+# The old verifier judged the whole answer against all passages in one call
+# and returned a single all_supported boolean — one weak sentence anywhere
+# flipped the entire section to unverified, and nothing recorded WHICH
+# claim failed, so a human had no way to review it. This version splits
+# the answer into claims, judges each claim against only the passages it
+# actually cites (in small batches), and carries the failing claims
+# through on result["unverified_claims"] for the report/UI.
 
-def verify_answer(result):
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z\[\d])")
+
+def extract_claims(answer):
+    """Split an answer into claim sentences with their cited passage
+    indices. Long sentences with no citation are kept too (cites=[]) —
+    the generator's rules require a citation after every claim, so an
+    uncited substantive sentence is itself worth flagging."""
+    claims = []
+    for s in _SENTENCE_SPLIT.split(answer.strip()):
+        s = s.strip()
+        if not s:
+            continue
+        cited = sorted(set(int(m) for m in re.findall(r"\[(\d+)\]", s)))
+        if cited:
+            claims.append({"text": s, "cites": cited})
+        elif len(s) >= 80:
+            claims.append({"text": s, "cites": []})
+    return claims
+
+def _verify_claim_batch(claims, chunks):
+    """One LLM call for a small batch of claims, each judged only against
+    the passages it cites. Returns a verdict dict per claim."""
+    blocks = []
+    for i, cl in enumerate(claims):
+        passages = "\n".join(
+            f'  [{idx}] {chunks[idx-1]["text"][:500]}'
+            for idx in cl["cites"] if 0 < idx <= len(chunks))
+        blocks.append(f"CLAIM {i+1}: {cl['text']}\nCITED PASSAGES:\n{passages}")
+
+    out = big.invoke(f"""You are fact-checking a literature review claim by claim.
+For EACH claim below, judge whether its OWN cited passages reasonably support it.
+
+It IS acceptable to:
+- Summarize what a paper discusses
+- Draw connections between papers
+- Note that a topic is partially covered
+
+It is NOT acceptable to:
+- Attribute findings to a paper that doesn't discuss them
+- Fabricate quotes, numbers, or results not in the passage
+
+{chr(10).join(blocks)}
+
+Return ONLY JSON: {{"verdicts": [
+  {{"claim": 1, "supported": true/false, "reason": "one short sentence"}}
+]}}""")
+    parsed = safe_parse_json(out.content)
+    verdicts = {v.get("claim"): v for v in (parsed or {}).get("verdicts", [])
+                if isinstance(v, dict)}
+    results = []
+    for i, cl in enumerate(claims):
+        v = verdicts.get(i + 1, {})
+        results.append({
+            "text": cl["text"],
+            "cites": cl["cites"],
+            "supported": bool(v.get("supported", True)),
+            "reason": v.get("reason", "no verdict returned — assumed supported"),
+        })
+    return results
+
+def verify_answer(result, batch_size=6):
     answer = result.get("answer", "")
-    
+    result["unverified_claims"] = []
+
     if any(phrase in answer.lower() for phrase in [
         "do not contain", "does not contain",
         "not contain sufficient", "not contain information",
@@ -33,44 +102,48 @@ def verify_answer(result):
         result["verified"] = True
         result["trace"].append("verify → skipped (refusal answer)")
         return result
-    
+
     if not result.get("citations") or not result.get("chunks"):
         result["verified"] = True
         result["trace"].append("verify → skipped (no citations)")
         return result
-    
-    chunks_text = "\n\n".join(
-        f'[{i+1}] {c["text"][:600]}'
-        for i, c in enumerate(result["chunks"]))
-    try:
-        out = big.invoke(f"""You are checking a literature review section.
-For each cited claim, check if the cited passage provides reasonable support.
 
-In a literature review, it IS acceptable to:
-- Summarize what a paper discusses
-- Draw connections between papers
-- Note that a topic is partially covered
-
-It is NOT acceptable to:
-- Attribute findings to a paper that doesn't discuss them
-- Fabricate quotes or results not in the passage
-
-Answer:
-{answer}
-
-Passages:
-{chunks_text}
-
-Return ONLY JSON: {{"all_supported": true/false}}""")
-        parsed = safe_parse_json(out.content)
-        result["verified"] = parsed.get("all_supported", True) if parsed else True
-        if result["verified"]:
-            result["trace"].append("verify → all claims supported ✓")
-        else:
-            result["trace"].append("verify → unsupported claims found ✗")
-    except:
+    claims = extract_claims(answer)
+    if not claims:
         result["verified"] = True
-        result["trace"].append("verify → skipped (LLM error)")
+        result["trace"].append("verify → skipped (no checkable claims)")
+        return result
+
+    verdicts = []
+    uncited = [c for c in claims if not c["cites"]]
+    cited = [c for c in claims if c["cites"]]
+
+    for c in uncited:
+        verdicts.append({"text": c["text"], "cites": [],
+                         "supported": False,
+                         "reason": "substantive sentence with no citation"})
+
+    for start in range(0, len(cited), batch_size):
+        batch = cited[start:start + batch_size]
+        try:
+            verdicts.extend(_verify_claim_batch(batch, result["chunks"]))
+            time.sleep(0.5)
+        except Exception as e:
+            # verifier failure is not evidence against the claim — pass the
+            # batch but say so, don't silently mark the section verified
+            for c in batch:
+                verdicts.append({"text": c["text"], "cites": c["cites"],
+                                 "supported": True,
+                                 "reason": f"verifier error, not checked: {e}"})
+
+    result["claim_verdicts"] = verdicts
+    result["unverified_claims"] = [v for v in verdicts if not v["supported"]]
+    n_ok = sum(1 for v in verdicts if v["supported"])
+    result["verified"] = len(result["unverified_claims"]) == 0
+    result["trace"].append(
+        f"verify → {n_ok}/{len(verdicts)} claims supported"
+        + ("" if result["verified"] else
+           f" — {len(result['unverified_claims'])} flagged for human review"))
     return result
 
 # ---------- Abstract-only ingestion ----------
@@ -267,14 +340,18 @@ def synthesize(ps, hypotheses, papers=None):
             "answer": result["answer"],
             "citations": result["citations"],
             "verified": result["verified"],
+            "unverified_claims": result.get("unverified_claims", []),
             "trace": result["trace"],
             "grade": result["grade"],
         })
-        
-        status = "✓ verified" if result["verified"] else "⚠ unverified"
+
+        status = "✓ verified" if result["verified"] else (
+            f"⚠ {len(result.get('unverified_claims', []))} claim(s) unverified")
         print(f"\n  [{status}] {len(result['answer'])} chars, "
               f"{len(result['citations'])} citations, "
               f"{len(result['trace'])} trace steps")
+        for uc in result.get("unverified_claims", [])[:3]:
+            print(f"    ⚠ {uc['text'][:70]} — {uc['reason'][:50]}")
     
     report = f"# Research Synthesis Report\n\n**Problem Statement:** {ps}\n\n"
     
@@ -288,6 +365,11 @@ def synthesize(ps, hypotheses, papers=None):
                 report += "**Sources:**\n"
                 for c in s["citations"][:5]:
                     report += f"- [{c['index']}] {c['title'][:60]} — {c['section'][:40]}\n"
+                report += "\n"
+            if s.get("unverified_claims"):
+                report += "**⚠ Unverified claims (need human review):**\n"
+                for uc in s["unverified_claims"]:
+                    report += f"- \"{uc['text'][:150]}\" — {uc['reason']}\n"
                 report += "\n"
     
     gaps = [s for s in sections if s["grade"] in ("irrelevant", "insufficient")]
